@@ -1,0 +1,11 @@
+node_modules
+docs
+readmes
+CHANGELOG.md
+auth
+.Sessions
+audio.mp3
+/lib/Wasm/*
+package-lock.json
+PRD.md
+voip-debug.log

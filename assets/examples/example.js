@@ -1,0 +1,1794 @@
+const { makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    RichSubMessageType,
+    captureUnifiedResponse,
+    sendUnifiedResponse,
+    renderLatexToPng,
+    prepareWAMessageMedia,
+    uploadUnencryptedToWA,
+    generateWAMessageFromContent,
+    monitorPresence,
+    formatDuration,
+    formatTimeAgo,
+    normalizeContactJid,
+    voipDiagnostics }
+    = require('../../lib/index.js');
+const qrcode = require('qrcode-terminal');
+const fs = require('fs');
+const path = require('path');
+const { createSamplePage } = require('./page.js');
+const { createSnakePage } = require('./snake.js');
+const { createLivePage } = require('./live_page.js');
+const { createSlotsPage } = require('./slots.js');
+
+async function startBot() {
+    const authDir = path.join(__dirname, 'auth');
+
+    // Check if clean flag is passed to reset the session
+    if (process.argv.includes('--clean')) {
+        console.log('Cleaning old auth session directory...');
+        if (fs.existsSync(authDir)) {
+            fs.rmSync(authDir, { recursive: true, force: true });
+            console.log('Old session cleared successfully.');
+        } else {
+            console.log('No existing session directory found to clean.');
+        }
+    }
+
+    console.log('Initializing connection...');
+
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+    const usePairingCode = process.argv.includes('--phone');
+    const phoneIndex = process.argv.indexOf('--phone');
+    const phoneNumber = usePairingCode && phoneIndex !== -1 ? process.argv[phoneIndex + 1] : null;
+
+    // Check if VoIP diagnostic mode is requested via flag or environment variable
+    const debugVoip = process.argv.includes('--debug-voip') || process.env.DEBUG_VOIP === '1';
+    if (debugVoip) {
+        voipDiagnostics.setDiagnosticMode(true);
+        console.log('\n======================================================');
+        console.log('🔍 [VoIP Diagnostics] Detailed VoIP Diagnostics & Tracing ENABLED');
+        console.log('======================================================\n');
+    }
+
+    const sock = makeWASocket({
+        auth: state,
+        syncFullHistory: false,
+        logger: require('pino')({ level: 'silent' }),
+        markOnlineOnConnect: true,
+        debugVoip,
+        voip: {
+            pthreadPoolSize: 4,
+            maxConcurrentCalls: 3,
+            onLimit: 'reject',
+            diagnostic: debugVoip
+        }
+    });
+
+    if (usePairingCode && phoneNumber && !state.creds.registered) {
+        setTimeout(async () => {
+            try {
+                const code = await sock.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
+                console.log('\n======================================');
+                console.log(`PAIRING CODE: ${code}`);
+                console.log('======================================\n');
+            } catch (err) {
+                console.error('Failed to request pairing code:', err);
+            }
+        }, 3000);
+    }
+
+    sock.ev.on('creds.update', saveCreds);
+
+    let lastIncomingSession = null;
+    const incomingCalls = new Map();
+
+    // Register VoIP Incoming Call Event Listener
+    sock.ev.on('call.incoming', async (session) => {
+        lastIncomingSession = session;
+        const callId = session.callId;
+
+        // Requirement 2 & 6: Deduplicate duplicate incoming_ringing events per Call ID
+        let context = incomingCalls.get(callId);
+        if (context) {
+            console.log(`[VoIP] [${callId}] Duplicate incoming_ringing ignored`);
+            return;
+        }
+
+        context = {
+            callId,
+            state: session.status || 'incoming_ringing',
+            accepting: false,
+            accepted: false,
+            streaming: false,
+            createdAt: Date.now()
+        };
+        incomingCalls.set(callId, context);
+
+        console.log(`\n📞 [VoIP] Incoming ${session.isVideo ? 'Video' : 'Voice'} Call!`);
+        console.log(`   Call ID: ${callId}`);
+        console.log(`   From: ${session.peerJid}`);
+        console.log(`   Caller PN: ${session.callerPn || 'N/A'}`);
+        console.log(`   Status: ${session.status} (waiting: ${session.isWaiting})`);
+
+        console.log(`[VoIP] [${callId}] Incoming call detected`);
+        console.log(`[VoIP] [${callId}] State: ${session.status}`);
+
+        // Register lifecycle event listeners BEFORE initiating acceptance (Requirement 5)
+        session.on('stateChange', (state) => {
+            if (context) context.state = state;
+            console.log(`[VoIP] [${callId}] State: ${state}`);
+        });
+        session.on('accepted', () => {
+            if (context) context.accepted = true;
+            console.log(`[VoIP] [${callId}] accepted!`);
+        });
+        session.on('connected', () => console.log(`[VoIP] [${callId}] connected! 🟢`));
+        session.on('audioReady', () => console.log(`[VoIP] [${callId}] audio ready! 🎵`));
+        session.on('streaming', () => console.log(`[VoIP] [${callId}] audio streaming active! 📡`));
+        session.on('rejected', (reason) => {
+            if (context) context.state = 'rejected';
+            console.log(`[VoIP] [${callId}] rejected: ${reason}`);
+        });
+        session.on('error', (err) => {
+            console.error(`[VoIP] [${callId}] Call error:`, err);
+        });
+        session.on('ended', (reason) => {
+            if (context) context.state = 'ended';
+            console.log(`[VoIP] [${callId}] Call ended: ${reason}`);
+            if (lastIncomingSession?.callId === callId) {
+                lastIncomingSession = null;
+            }
+            incomingCalls.delete(callId);
+            console.log(`[VoIP] [${callId}] Cleanup completed`);
+        });
+        session.on('audio', (pcmChunk) => {
+            // Decrypted inbound PCM audio chunk received from caller
+        });
+
+        // Automatically accept the incoming call and play audio.mp3
+        const autoAcceptAndStream = async () => {
+            if (session.ended || context.state === 'ended') return;
+
+            // Requirement 2 & 16: Idempotent acceptance guard
+            if (context.accepting || context.accepted) {
+                console.log(`[VoIP] [${callId}] Acceptance already in progress; ignoring duplicate request`);
+                return;
+            }
+            context.accepting = true;
+
+            try {
+                const audioPath = path.resolve(__dirname, 'audio.mp3');
+                const audioSource = fs.existsSync(audioPath) ? audioPath : './audio.mp3';
+
+                console.log(`[VoIP] [${callId}] Acceptance started`);
+                console.log(`[VoIP] [${callId}] Accepting incoming call...`);
+
+                await session.accept({
+                    audioSource,
+                    repeatAudio: false
+                });
+
+                if (session.ended || context.state === 'ended') return;
+                context.accepted = true;
+                context.accepting = false;
+
+                // Requirement 7: Prevent duplicate audio streaming
+                if (context.streaming) {
+                    console.log(`[VoIP] [${callId}] Audio streaming already active; ignoring duplicate request`);
+                    return;
+                }
+                context.streaming = true;
+                console.log(`[VoIP] [${callId}] Audio initialization started`);
+                console.log(`[VoIP] [${callId}] Streaming started`);
+
+            } catch (err) {
+                context.accepting = false;
+                if (!session.ended && context.state !== 'ended') {
+                    console.error(`[VoIP] [${callId}] Error auto-accepting call:`, err);
+                    try { fs.appendFileSync(path.resolve(process.cwd(), "voip-debug.log"), `[VoIP] [${callId}] Error auto-accepting call: ${err?.stack || err}\n`); } catch { }
+                }
+            }
+        };
+
+        if (session.isWaiting) {
+            console.log(`[VoIP] [${callId}] Call is queued in waiting list, will auto-accept once unblocked.`);
+            session.once('ringing', () => {
+                void autoAcceptAndStream();
+            });
+        } else {
+            void autoAcceptAndStream();
+        }
+    });
+
+    // Register MEX Notification Dispatcher Event Listeners
+    sock.ev.on('messaging-history.status', ({ syncType, status, explicit }) => {
+        console.log(`[messaging-history.status] History sync status: ${status} (${syncType}) explicit=${explicit}`);
+    });
+
+    sock.ev.on('message-capping.update', ({ used_quota, total_quota }) => {
+        console.log(`[message-capping.update] Message quota used: ${used_quota}/${total_quota}`);
+    });
+
+    sock.ev.on('lid-mapping.update', ({ lid, pn }) => {
+        console.log(`[lid-mapping.update] LID: ${lid} mapped to PN: ${pn}`);
+    });
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr, reachoutTimeLock } = update;
+
+        if (reachoutTimeLock?.isActive) {
+            console.log(`[Reachout TimeLock] Restricted until: ${reachoutTimeLock.timeEnforcementEnds}`);
+        }
+
+        if (qr && !usePairingCode) {
+            console.log('Scan the QR code below to connect:');
+            qrcode.generate(qr, { small: true });
+        }
+
+        if (connection === 'close') {
+            console.log('Connection closed due to:', lastDisconnect?.error, '. Auto-reconnecting...');
+            startBot();
+        } else if (connection === 'open') {
+            console.log('\n======================================');
+            console.log('WhatsApp Bot is successfully connected!');
+            console.log('======================================\n');
+
+            let presenceMonitor = null;
+            const targetJid = ['923001234567@s.whatsapp.net', '923021234567@s.whatsapp.net'];
+
+            // Start presence tracking for target JIDs
+            if (!presenceMonitor) {
+                console.log(`[Presence] Starting presence tracking for: ${targetJid.join(', ')}`);
+                presenceMonitor = monitorPresence(sock, targetJid, {
+                    logToConsole: false,
+                    autoResubscribe: true,
+                    timezone: '+05:00',
+                    trackMessagesAsPresence: false
+                });
+
+                presenceMonitor.on('online', (data) => {
+                    console.log(`🟢 Contact ${data.jid} is ONLINE at ${presenceMonitor.formatTime(data.onlineAt)}`);
+                    console.log('online Data', data)
+                });
+
+                presenceMonitor.on('offline', (data) => {
+                    console.log(`[Presence Event] 🟡 Contact ${data.jid} is OFFLINE at ${presenceMonitor.formatTime(data.offlineAt)}`);
+                    console.log(`[Presence Event] ⏱️ Duration: ${data.duration}`);
+                    if (data.lastSeen) {
+                        console.log(`[Presence Event] 👁️ Last Seen: ${presenceMonitor.formatTime(data.lastSeen)}`);
+                    }
+                    console.log('offline Data', data)
+                });
+
+                presenceMonitor.on('session', (session) => {
+                    console.log(`[Presence Event] 🔴 Session completed for ${session.jid}:`);
+                    console.log(`  • ⏱️ Started : ${presenceMonitor.formatDateTime(session.onlineAt)}`);
+                    console.log(`  • ⏱️ Ended   : ${presenceMonitor.formatDateTime(session.offlineAt)}`);
+                    console.log(`  • ⏱️ Duration: ${session.duration} (${session.durationMs}ms)`);
+                    console.log('session Data', session)
+                });
+
+                presenceMonitor.on('error', (err) => {
+                    console.error(`[Presence UPDATE] Error: ${err.message}`);
+                });
+            }
+        }
+    });
+
+    // Listen to messages
+    sock.ev.on('messages.upsert', async (update) => {
+
+        try {
+            if (!update.messages?.length) return;
+
+            if (update.type !== 'notify') return;
+            const [message] = update.messages;
+            if (!message || message.key?.fromMe) return;
+
+            // 🚫 Ignore all protocol messages (history sync, security notifications, app state sync, deleted messages, etc.)
+            if (message.message?.protocolMessage) return;
+
+            const msgContent = message.message || {};
+            const jid = message.key.remoteJidAlt || message.key.remoteJid;
+            if (!jid) return;
+
+            // Helper to normalize JIDs (e.g., removing device sub-IDs)
+            const normalizeJid = (id) => {
+                if (!id) return '';
+                if (id.includes(':')) {
+                    const [user, host] = id.split('@');
+                    const [userId] = user.split(':');
+                    return `${userId}@${host}`;
+                }
+                return id;
+            };
+
+            const normalizedJid = normalizeJid(jid);
+
+            const getText = () =>
+                msgContent.conversation ||
+                msgContent.extendedTextMessage?.text ||
+                msgContent.imageMessage?.caption ||
+                msgContent.videoMessage?.caption ||
+                '';
+
+            const getButtonText = () => {
+                if (msgContent.listResponseMessage)
+                    return msgContent.listResponseMessage.title || msgContent.listResponseMessage.description || '';
+                if (msgContent.templateButtonReplyMessage)
+                    return msgContent.templateButtonReplyMessage.selectedDisplayText || msgContent.templateButtonReplyMessage.selectedId || '';
+                if (msgContent.buttonsResponseMessage)
+                    return msgContent.buttonsResponseMessage.selectedDisplayText || msgContent.buttonsResponseMessage.selectedButtonId || '';
+                if (msgContent.interactiveResponseMessage) {
+                    const i = msgContent.interactiveResponseMessage;
+                    return i.listResponse?.title ||
+                        i.listResponse?.description ||
+                        i.nativeFlowResponse?.response?.reply ||
+                        i.reply ||
+                        i.buttonReplyMessage?.displayText || '';
+                }
+                return '';
+            };
+
+            const text = (getText() || getButtonText() || '').trim();
+            if (!text.startsWith('!')) return;
+
+            const command = text.split(' ')[0].toLowerCase();
+            const args = text.slice(command.length).trim();
+
+            console.log(`[Command Received] ${command} from ${normalizedJid}`);
+
+            switch (command) {
+                case '!ping': {
+                    await sock.sendMessage(normalizedJid, { text: 'pong! 🏓' }, { quoted: message });
+                    break;
+                }
+                case '!presence': {
+                    const rawArg = args ? args.trim() : '';
+                    if (!presenceMonitor) {
+                        await sock.sendMessage(normalizedJid, { text: '⚠️ Presence tracker is not initialized.' }, { quoted: message });
+                        break;
+                    }
+
+                    if (rawArg && rawArg.toLowerCase() !== 'all') {
+                        // Single contact query
+                        const target = normalizeContactJid(rawArg.replace(/[^0-9@a-z._-]/gi, ''));
+                        await presenceMonitor.resubscribe(target);
+                        const status = presenceMonitor.getStatus(target);
+
+                        if (!status) {
+                            await sock.sendMessage(normalizedJid, {
+                                text: `⚠️ No presence data tracked yet for ${target}.\nSubscribing now to monitor updates.`
+                            }, { quoted: message });
+                            await presenceMonitor.subscribe(target);
+                        } else {
+                            const isOnline = status.currentStatus === 'online';
+                            let text = `📊 *Presence Status for ${status.jid}*:\n\n`;
+                            text += `• Status: *${isOnline ? 'ONLINE 🟢' : 'OFFLINE 🔴'}*\n`;
+                            if (status.lid) {
+                                text += `• Linked LID: ${status.lid}\n`;
+                            }
+                            if (isOnline) {
+                                if (status.currentSessionStart) {
+                                    const activeMs = Math.max(0, Date.now() - status.currentSessionStart.getTime());
+                                    text += `• Online Since: ${presenceMonitor.formatTime(status.currentSessionStart)} (Active: ${formatDuration(activeMs)})\n`;
+                                }
+                            } else {
+                                if (status.lastSeen) {
+                                    text += `• Last Seen: ${presenceMonitor.formatDateTime(status.lastSeen)} (${formatTimeAgo(status.lastSeen)})\n`;
+                                }
+                                if (status.lastOfflineAt) {
+                                    text += `• Last Offline: ${presenceMonitor.formatDateTime(status.lastOfflineAt)} (${formatTimeAgo(status.lastOfflineAt)})\n`;
+                                }
+                                if (status.lastDuration) {
+                                    text += `• Last Online Duration: ${status.lastDuration}\n`;
+                                }
+                            }
+                            if (status.serverLastSeen) {
+                                text += `• WhatsApp Server Last Seen: ${presenceMonitor.formatDateTime(status.serverLastSeen)} (${formatTimeAgo(status.serverLastSeen)})\n`;
+                            }
+                            text += `• Timezone: ${presenceMonitor.getTimezone()}\n`;
+                            text += `• Total Sessions Recorded: ${status.sessions.length}`;
+                            await sock.sendMessage(normalizedJid, { text }, { quoted: message });
+                        }
+                    } else {
+                        // Multi-contact dashboard for all monitored contacts
+                        const allMonitored = Array.from(new Set([...targetJid, ...presenceMonitor.getMonitoredJids()]))
+                            .filter(j => !j.endsWith('@lid')); // Only display primary phone JIDs in summary
+
+                        let text = `📊 *Monitored Contacts Presence Dashboard* (${presenceMonitor.getTimezone()}):\n\n`;
+
+                        for (const jid of allMonitored) {
+                            await presenceMonitor.resubscribe(jid);
+                            const status = presenceMonitor.getStatus(jid);
+                            const cleanNum = jid.split('@')[0];
+
+                            if (!status || status.currentStatus === 'unknown') {
+                                text += `⚪ *${cleanNum}*: Unknown / Pending (Subscribing...)\n\n`;
+                                continue;
+                            }
+
+                            const isOnline = status.currentStatus === 'online';
+                            if (isOnline) {
+                                const activeMs = status.currentSessionStart ? Math.max(0, Date.now() - status.currentSessionStart.getTime()) : 0;
+                                text += `🟢 *${cleanNum}*: *ONLINE*\n`;
+                                text += `  • Online Since: ${status.currentSessionStart ? presenceMonitor.formatTime(status.currentSessionStart) : 'Now'} (Active: ${formatDuration(activeMs)})\n`;
+                                text += `  • Sessions: ${status.sessions.length}\n\n`;
+                            } else {
+                                text += `🔴 *${cleanNum}*: *OFFLINE*\n`;
+                                if (status.lastSeen) {
+                                    text += `  • Last Seen: ${presenceMonitor.formatDateTime(status.lastSeen)} (${formatTimeAgo(status.lastSeen)})\n`;
+                                } else {
+                                    text += `  • Last Seen: Hidden by privacy or not seen yet\n`;
+                                }
+                                if (status.lastDuration) {
+                                    text += `  • Last Duration: ${status.lastDuration}\n`;
+                                }
+                                text += `  • Sessions: ${status.sessions.length}\n\n`;
+                            }
+                        }
+
+                        text += `💡 _Tip: Use !presence <number> for details, or !timezone <+5|Asia/Karachi> to change zone._`;
+                        await sock.sendMessage(normalizedJid, { text }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!timezone':
+                case '!tz': {
+                    const newTz = args ? args.trim() : '';
+                    if (!presenceMonitor) {
+                        await sock.sendMessage(normalizedJid, { text: '⚠️ Presence tracker is not initialized.' }, { quoted: message });
+                        break;
+                    }
+                    if (!newTz) {
+                        const currentTz = presenceMonitor.getTimezone();
+                        const nowFormatted = presenceMonitor.formatDateTime(new Date());
+                        await sock.sendMessage(normalizedJid, {
+                            text: `🕒 *Current Timezone*: ${currentTz}\n• Local Time: *${nowFormatted}*\n\n_To change dynamically, send: !timezone +5, !timezone Asia/Karachi, or !timezone UTC_`
+                        }, { quoted: message });
+                    } else {
+                        presenceMonitor.setTimezone(newTz);
+                        const nowFormatted = presenceMonitor.formatDateTime(new Date());
+                        await sock.sendMessage(normalizedJid, {
+                            text: `✅ *Timezone dynamically updated to*: ${newTz}\n• Current Local Time: *${nowFormatted}*`
+                        }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!table': {
+                    await sock.sendTable(normalizedJid, 'Developer Team Metrics', ['Name', 'Role', 'Status', 'Tasks Completed'], [
+                        ['Member 1', 'Frontend Lead', 'Active', '45'],
+                        ['Member 2', 'Rust WASM Dev', 'Coding', '89'],
+                        ['Member 3', 'QA Engineer', 'Testing', '23'],
+                        ['Member 4', 'Product Owner', 'Meeting', '12']
+                    ], message, {
+                        headerText: 'Here is the current team status table:',
+                        footer: 'Generated automatically by Innovators Baileys V2 Bot.'
+                    });
+                    break;
+                }
+                case '!list': {
+                    await sock.sendList(normalizedJid, 'Interactive Help Menu', [
+                        '!ping         - Simple ping test',
+                        '!table        - Show a sample rich table',
+                        '!list         - Show this help list',
+                        '!markdown     - Show a rich markdown response',
+                        '!code         - Show a code snippet in JS or Python',
+                        '!lateximage   - Send a single LaTeX image',
+                        '!latexinlineimage - Send LaTeX inline images (album)',
+                        '!rich         - Show a mixed content message',
+                        '!buttons      - Send interactive buttons',
+                        '!template     - Send a template button message',
+                        '!interact     - Send interactive quick replies',
+                        '!sections     - Send traditional section list',
+                        '!share        - Share phone number',
+                        '!request      - Request phone number',
+                        '!ai           - Send a message with Meta AI icon',
+                        '!capture      - Capture a message text to buffer',
+                        '!sendcaptured - Send all captured buffered messages',
+                        '!linkpreview  - Send a link with custom preview',
+                        '!checkusername - Check if a username is available',
+                        '!setusername  - Set your username',
+                        '!deleteusername - Delete your current username',
+                        '!myusername   - Retrieve your current username',
+                        '!setpin       - Set or delete username PIN',
+                        '!findusername - Find a user JID by username',
+                        '!fetchusernames - Fetch usernames of JIDs',
+                        '!resolveusername - Resolve a username to JID/LID details',
+                        '!carousel     - Send an interactive carousel message',
+                        '!mediabuttons - Send buttons with media & sections',
+                        '!label        - Send text with secure Meta service label',
+                        '!spoiler      - Send an image with spoiler wrapping',
+                        '!lottie       - Send a sticker with isLottie enabled',
+                        '!groupstatus  - Send status update wrapped for group',
+                        '!mentionall   - Mention all group participants',
+                        '!viewonce     - Send image as view-once V1',
+                        '!viewoncev2   - Send image as view-once V2',
+                        '!viewonceext  - Send image as view-once V2 Ext',
+                        '!interactivemsg - Send custom interactive buttons (text, image, or location)',
+                        '!call         - Place a voice call and stream audio',
+                        '!vcall        - Place a video call with video/audio feed',
+                        '!calls        - Place concurrent calls to multiple targets',
+                        '!callinfo     - Show active VoIP calls and memory stats',
+                        '!voipstats    - Show VoIP memory, worker & heap metrics',
+                        '!acceptcall   - Accept an incoming call (!acceptcall [callId])',
+                        '!rejectcall   - Reject an incoming call (!rejectcall [callId] [reason])',
+                        '!mute         - Mute an active VoIP call (!mute [callId])',
+                        '!unmute       - Unmute an active VoIP call (!unmute [callId])',
+                        '!endcall      - Hang up a specific call (!endcall <callId>)',
+                        '!endallcalls  - Hang up all active VoIP calls',
+                        '!html         - Send interactive rich HTML UI card with background audio (GenAI HTML)',
+                        '!snake        - Play CyberSnake HTML5 Canvas Game (GenAI HTML)',
+                        '!slots        - Play Fruit Bonanza Slots Game (GenAI HTML)',
+                        '!page         - Show interactive CyberPulse GenAI sample page (HTML/CSS/JS)',
+                        '!tikdown      - Render live TikDown web app from public URL (GenAI HTML)',
+                        '!livepage     - Render any public web page (e.g. !livepage https://...) (GenAI HTML)'
+                    ], message, {
+                        headerText: 'Available commands:',
+                        footer: 'Type any of these commands to test.'
+                    });
+                    break;
+                }
+                case '!code': {
+                    const defaultCode = `// Fetch profile details\nconst user = await sock.findUserByUsername('user');\nif (user) {\n    console.log(\`JID: \${user.jid}\`);\n}`;
+                    const pythonCode = `# Quick Python Example\ndef greet(name):\n    print(f"Hello, {name}!")\n\ngreet("User")`;
+
+                    const language = args.toLowerCase() === 'python' ? 'python' : 'javascript';
+                    const codeToSend = language === 'python' ? pythonCode : defaultCode;
+
+                    await sock.sendCodeBlock(normalizedJid, codeToSend, message, {
+                        language,
+                        title: `Sample Code (${language})`,
+                        footer: 'Syntax highlighted by WhatsApp Meta AI engine.'
+                    });
+                    break;
+                }
+                case '!markdown': {
+                    const mdText = '# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\n\n___\n\n> To use a horizontal line, you need to have two "\\n" above and below the "___"\n==Highlighted text==\n# By the way, ^you^ can _mix_ ==multiple markdowns== for a **richer response**\n🔗 [Click here to visit Google](https://google.com)\n🔗 [GitHub Repository](https://github.com/innovatorssoft/Baileys)\n###### Try different combinations... ';
+                    await sock.sendMarkdown(normalizedJid, mdText, message);
+                    break;
+                }
+                case '!lateximage': {
+                    try {
+                        const result = await sock.sendLatexImage(
+                            normalizedJid,
+                            message,
+                            {
+                                formula: 'E=mc^2',
+                                caption: 'Mass-Energy Equivalence'
+                            }
+                        );
+                    } catch (error) {
+                        console.error('Error in !lateximage:', error);
+                    }
+                    break;
+                }
+
+                case '!latexinlineimage': {
+                    try {
+                        const result = await sock.sendLatexInlineImage(
+                            normalizedJid,
+                            message,
+                            {
+                                expressions: [
+                                    { latexExpression: 'e^{i\\pi} + 1 = 0' },
+                                    { latexExpression: '\\int_a^b x^2 \\, dx = \\frac{b^3 - a^3}{3}' },
+                                    { latexExpression: 'f(x) = \\sum_{n=0}^{\\infty} \\frac{f^{(n)}(a)}{n!} (x-a)^n' }
+                                ],
+                                caption: true // Use each LaTeX expression as the caption for its respective image in the album
+                            }
+                        );
+                        //console.log('LaTeX Inline Image Payload:', JSON.stringify(result, null, 2));
+                    } catch (error) {
+                        console.error('Error in !latexinlineimage:', error);
+                    }
+                    break;
+                }
+                case '!rich': {
+                    const richLatexExpr = 'E = mc^2';
+                    const richPngBuf = await renderLatexToPng(richLatexExpr);
+                    const richImageUrl = (await uploadUnencryptedToWA(richPngBuf.buffer, sock.waUploadToServer)).url;
+
+                    await sock.sendRichMessage(normalizedJid, [
+                        {
+                            messageType: RichSubMessageType.TEXT,
+                            messageText: '# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\n\n___\n\n> To use a horizontal line, you need to have two "\\n" above and below the "___"\n==Highlighted text==\n# By the way, ^you^ can _mix_ ==multiple markdowns== for a **richer response**\n###### Try different combinations...'
+                        },
+                        {
+                            messageType: RichSubMessageType.TABLE,
+                            tableMetadata: {
+                                title: 'Product Prices',
+                                rows: [
+                                    { items: ['Product', 'Price', 'Stock'], isHeading: true },
+                                    { items: ['Innovators Baileys Pro', '$49.99', 'In Stock'] },
+                                    { items: ['Rust WASM Plugin', '$19.99', 'Low Stock'] }
+                                ]
+                            }
+                        },
+                        {
+                            messageType: RichSubMessageType.TEXT,
+                            messageText: 'LaTeX Formula:'
+                        },
+                        {
+                            messageType: RichSubMessageType.INLINE_IMAGE,
+                            imageMetadata: {
+                                imageUrl: {
+                                    imagePreviewUrl: richImageUrl,
+                                    imageHighResUrl: richImageUrl
+                                },
+                                imageText: richLatexExpr,
+                                alignment: 2
+                            }
+                        },
+                        {
+                            messageType: RichSubMessageType.CODE,
+                            codeMetadata: {
+                                codeLanguage: 'javascript',
+                                codeBlocks: [
+                                    { highlightType: 1, codeContent: 'const ' },
+                                    { highlightType: 0, codeContent: 'price = ' },
+                                    { highlightType: 4, codeContent: '49.99' },
+                                    { highlightType: 0, codeContent: ';\n' },
+                                    { highlightType: 1, codeContent: 'if ' },
+                                    { highlightType: 0, codeContent: '(price > ' },
+                                    { highlightType: 4, codeContent: '20' },
+                                    { highlightType: 0, codeContent: ') {\n    console.log(' },
+                                    { highlightType: 3, codeContent: '"Premium tier"' },
+                                    { highlightType: 0, codeContent: ');\n}' }
+                                ]
+                            }
+                        }
+                    ], message, { useMarkdown: true });
+                    break;
+                }
+                case '!buttons': {
+                    await sock.sendMessage(normalizedJid, {
+                        buttons: [
+                            { buttonId: 'btn1', buttonText: { displayText: 'Option 1' }, type: 1 },
+                            { buttonId: 'btn2', buttonText: { displayText: 'Option 2' }, type: 1 }
+                        ],
+                        text: 'Pick an option:',
+                        footer: 'Powered by Innovators Baileys'
+                    }, { quoted: message });
+                    break;
+                }
+                case '!template': {
+                    await sock.sendMessage(normalizedJid, {
+                        templateButtons: [
+                            { text: '🌐 Visit Link', url: 'https://github.com/innovatorssoft/baileys' },
+                            { text: '📞 Call Support', call: '+91XXXXXXXXXX' },
+                            { text: '👋🏻 Quick Reply', id: 'id1' }
+                        ],
+                        text: 'Template message body example:',
+                        footer: 'Powered by Innovators Baileys'
+                    }, { quoted: message });
+                    break;
+                }
+                case '!interact': {
+                    try {
+                        await sock.sendMessage(normalizedJid, {
+                            interactiveButtons: [
+                                { text: '👋🏻 Greeting', id: '#Greeting' },
+                                { text: '📋 Copy Code', copy: '@nimuthu/baliyes' },
+                                { text: '🌐 Source', url: 'https://github.com/innovatorssoft/baileys' }
+                            ],
+                            body: { text: 'Are you sure you want to proceed?' },
+                            footer: { text: 'Innovators Baileys interactive' }
+                        }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!sections': {
+                    await sock.sendMessage(normalizedJid, {
+                        sections: [
+                            {
+                                title: 'Section 1',
+                                rows: [
+                                    { title: 'Row 1', rowId: 'r1', description: 'Description for row 1' },
+                                    { title: 'Row 2', rowId: 'r2', description: 'Description for row 2' }
+                                ]
+                            }
+                        ],
+                        title: 'Interactive Sections List',
+                        text: 'List body text here',
+                        footer: 'Innovators Baileys footer',
+                        buttonText: 'Open List Options'
+                    }, { quoted: message });
+                    break;
+                }
+                case '!share': {
+                    await sock.sendMessage(normalizedJid, { sharePhoneNumber: true }, { quoted: message });
+                    break;
+                }
+                case '!request': {
+                    await sock.sendMessage(normalizedJid, { requestPhoneNumber: true }, { quoted: message });
+                    break;
+                }
+                case '!ai': {
+                    await sock.sendMessage(normalizedJid, { text: 'Hello! I am replying with the Meta AI bot icon attached.' }, { ai: true, quoted: message });
+                    break;
+                }
+                case '!capture': {
+                    if (!args) {
+                        await sock.sendMessage(normalizedJid, { text: 'Please specify the message text to capture. Usage: !capture <text>' }, { quoted: message });
+                        break;
+                    }
+                    captureUnifiedResponse(normalizedJid, { text: args }, { quoted: message });
+                    await sock.sendMessage(normalizedJid, { text: `Successfully captured message: "${args}". Type !sendcaptured to broadcast all captured responses.` }, { quoted: message });
+                    break;
+                }
+                case '!sendcaptured': {
+                    await sock.sendMessage(normalizedJid, { text: 'Sending all captured responses...' }, { quoted: message });
+                    await sendUnifiedResponse(sock.sendMessage.bind(sock));
+                    break;
+                }
+                case '!linkpreview': {
+                    try {
+                        const urlA = 'https://github.com/innovatorssoft/baileys';
+                        const logoPath = path.join(__dirname, 'logo.png');
+                        const faviconPath = path.join(__dirname, 'favicon.png');
+
+                        await sock.sendMessage(normalizedJid, { text: 'Sending standard link preview...' }, { quoted: message });
+
+                        // --- Send a text message with a link preview
+                        await sock.sendMessage(normalizedJid, {
+                            text: urlA + ' 👆🏻 Check it out!',
+                            linkPreview: {
+                                'matched-text': urlA,
+                                title: '🌱 @nimuthu/baliyes',
+                                description: 'Modified Baileys Fork',
+                                previewType: 0, // --- Use 1 for video playback in the link preview
+                                jpegThumbnail: fs.readFileSync(logoPath)
+                            }
+                        }, { quoted: message });
+
+                        await sock.sendMessage(normalizedJid, { text: 'Sending large link preview with favicon...' }, { quoted: message });
+
+                        const urlB = 'https://github.com/innovatorssoft/baileys#readme';
+
+                        const { imageMessage: image } = await prepareWAMessageMedia({
+                            image: {
+                                url: logoPath
+                            }
+                        }, {
+                            upload: sock.waUploadToServer,
+                            mediaTypeOverride: 'thumbnail-link'
+                        });
+
+                        // --- Set the thumbnail display size
+                        image.height = 720;
+                        image.width = 480;
+
+                        await sock.sendMessage(normalizedJid, {
+                            text: urlB + ' 👆🏻 Check it out!',
+                            linkPreview: {
+                                'matched-text': urlB,
+                                title: '🌱 @nimuthu/baliyes',
+                                description: 'Modified Baileys Fork',
+                                previewType: 0,
+                                jpegThumbnail: fs.readFileSync(logoPath),
+                                highQualityThumbnail: image,
+                                linkPreviewMetadata: {
+                                    linkMediaDuration: 0,
+                                    socialMediaPostType: 1, // --- Enum: 0 = NONE, 1 = REEL, 2 = LIVE_VIDEO, 3 = LONG_VIDEO, 4 = SINGLE_IMAGE, 5 = CAROUSEL
+                                }
+                            },
+                            favicon: {
+                                url: faviconPath
+                            }
+                        }, { quoted: message });
+
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error sending link preview: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!checkusername': {
+                    if (!args) {
+                        await sock.sendMessage(normalizedJid, { text: 'Usage: !checkusername <username>' }, { quoted: message });
+                        break;
+                    }
+                    try {
+                        const check = await sock.checkUsername(args);
+                        if (check.available) {
+                            await sock.sendMessage(normalizedJid, { text: `✅ @${check.username} is available!` }, { quoted: message });
+                        } else {
+                            let text = `❌ @${check.username} is taken.\n`;
+                            if (check.suggestions?.length) {
+                                text += `Suggestions: ${check.suggestions.join(', ')}\n`;
+                            }
+                            if (check.rejectionReasons?.length) {
+                                text += `Reasons: ${check.rejectionReasons.join(', ')}`;
+                            }
+                            await sock.sendMessage(normalizedJid, { text: text.trim() }, { quoted: message });
+                        }
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error checking username: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!setusername': {
+                    if (!args) {
+                        await sock.sendMessage(normalizedJid, { text: 'Usage: !setusername <username> [pin]' }, { quoted: message });
+                        break;
+                    }
+                    const [uname, pin] = args.split(' ');
+                    try {
+                        await sock.setUsername(uname, pin ? { pin } : undefined);
+                        await sock.sendMessage(normalizedJid, { text: `✅ Username set to @${uname}${pin ? ' protected with PIN ' + pin : ''}!` }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error setting username: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!deleteusername': {
+                    try {
+                        await sock.deleteUsername();
+                        await sock.sendMessage(normalizedJid, { text: `✅ Username deleted successfully!` }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error deleting username: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!myusername': {
+                    try {
+                        const username = await sock.getMyUsername();
+                        if (username) {
+                            await sock.sendMessage(normalizedJid, { text: `Your username: @${username}` }, { quoted: message });
+                        } else {
+                            await sock.sendMessage(normalizedJid, { text: `You don't have a username set.` }, { quoted: message });
+                        }
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error getting username: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!setpin': {
+                    if (!args) {
+                        await sock.sendMessage(normalizedJid, { text: 'Usage: !setpin <pin|delete>' }, { quoted: message });
+                        break;
+                    }
+                    try {
+                        const pin = args === 'delete' ? null : args;
+                        await sock.setUsernamePin(pin);
+                        await sock.sendMessage(normalizedJid, { text: pin ? `✅ Pin set to ${pin}` : `✅ Pin deleted` }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error setting pin: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!findusername': {
+                    if (!args) {
+                        await sock.sendMessage(normalizedJid, { text: 'Usage: !findusername <username> [pin]' }, { quoted: message });
+                        break;
+                    }
+                    const [uname, pin] = args.split(' ');
+                    try {
+                        const result = await sock.findUserByUsername(uname, pin);
+                        if (result) {
+                            const contactNote = result.contact ? ' (in your contacts)' : ' (not in your contacts)';
+                            await sock.sendMessage(normalizedJid, { text: `🔍 Found user${contactNote}!\nJID: ${result.jid}` }, { quoted: message });
+                        } else {
+                            await sock.sendMessage(normalizedJid, { text: `❌ User @${uname} not found or not on WhatsApp.` }, { quoted: message });
+                        }
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error finding user: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!fetchusernames': {
+                    if (!args) {
+                        await sock.sendMessage(normalizedJid, { text: 'Usage: !fetchusernames <jid1> [jid2] ...' }, { quoted: message });
+                        break;
+                    }
+                    const jids = args.split(' ');
+                    try {
+                        const results = await sock.fetchContactUsernames(...jids);
+                        let responseText = '📋 Username Fetch Results:\n';
+                        for (const res of results) {
+                            responseText += `• ${res.id} -> ${res.username || '(no username)'}\n`;
+                        }
+                        await sock.sendMessage(normalizedJid, { text: responseText.trim() }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error fetching usernames: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!resolveusername': {
+                    const uname = args || 'midsoune';
+                    try {
+                        const result = await sock.resolveUsername(uname);
+                        console.log('Resolved User Names ' + JSON.stringify(result, null, 2));
+                        await sock.sendMessage(normalizedJid, {
+                            text: result ? `🔍 Resolved @${uname}:\n` + JSON.stringify(result, null, 2) : `❌ User @${uname} not found.`
+                        }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error resolving username: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!isonwhatsapp': {
+                    const targets = (args || '169702865256530@lid').trim().split(/\s+/).filter(Boolean);
+                    try {
+                        const result = await sock.onWhatsApp(...targets);
+                        console.log(result);
+
+                        if (!result || result.length === 0) {
+                            await sock.sendMessage(normalizedJid, {
+                                text: `❌ No results found. Target(s) [${targets.join(', ')}] are not registered on WhatsApp.`
+                            }, { quoted: message });
+                            break;
+                        }
+                        let responseText = '📋 On WhatsApp Check Results:\n';
+                        for (const res of result) {
+                            responseText += `• ${res.jid} -> Exists: ${res.exists}, LID: ${res.lid || 'N/A'}, PN: ${res.pn || 'N/A'}, Username: ${res.username || 'N/A'}\n`;
+                        }
+                        await sock.sendMessage(normalizedJid, { text: responseText.trim() }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error checking WhatsApp status: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!carousel': {
+                    try {
+                        const logoPath = path.join(__dirname, 'logo.png');
+                        await sock.sendMessage(normalizedJid, {
+                            text: '🗂️ Interactive with Carousel!',
+                            footer: 'Innovators Baileys V2 Carousel',
+                            cards: [
+                                {
+                                    image: { url: logoPath },
+                                    caption: '🖼️ Image 1',
+                                    footer: '🏷️ Pinterest',
+                                    nativeFlow: [{
+                                        text: '🌐 Source',
+                                        url: 'https://github.com/innovatorssoft/baileys',
+                                        useWebview: true
+                                    }]
+                                },
+                                {
+                                    image: { url: logoPath },
+                                    caption: '🖼️ Image 2',
+                                    footer: '🏷️ Pinterest',
+                                    offerText: '🏷️ New Coupon!',
+                                    offerCode: '@nimuthu/baliyes',
+                                    offerUrl: 'https://github.com/innovatorssoft/baileys',
+                                    offerExpiration: Date.now() + 3600000,
+                                    nativeFlow: [{
+                                        text: '🌐 Source',
+                                        url: 'https://github.com/innovatorssoft/baileys'
+                                    }]
+                                },
+                                {
+                                    image: { url: logoPath },
+                                    caption: '🖼️ Image 3',
+                                    footer: '🏷️ Pinterest',
+                                    optionText: '👉🏻 Select Options',
+                                    optionTitle: '👉🏻 Select Options',
+                                    offerText: '🏷️ New Coupon!',
+                                    offerCode: '@nimuthu/baliyes',
+                                    offerUrl: 'https://github.com/innovatorssoft/baileys',
+                                    offerExpiration: Date.now() + 3600000,
+                                    nativeFlow: [
+                                        {
+                                            text: '🛒 Product',
+                                            id: '#Product',
+                                            icon: 'default'
+                                        },
+                                        {
+                                            text: '🌐 Source',
+                                            url: 'https://github.com/innovatorssoft/baileys'
+                                        }
+                                    ]
+                                }
+                            ]
+                        }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!mediabuttons': {
+                    try {
+                        const logoPath = path.join(__dirname, 'logo.png');
+                        await sock.sendMessage(normalizedJid, {
+                            image: { url: logoPath },
+                            caption: '👆🏻 Buttons and Native Flow!',
+                            footer: 'Innovators Baileys V2',
+                            buttons: [
+                                {
+                                    text: '👋🏻 Rating',
+                                    id: '#Rating'
+                                },
+                                {
+                                    text: '📋 Select',
+                                    sections: [
+                                        {
+                                            title: '✨ Section 1',
+                                            rows: [{
+                                                header: '',
+                                                title: '💭 Secret Ingredient',
+                                                description: '',
+                                                id: '#SecretIngredient'
+                                            }]
+                                        },
+                                        {
+                                            title: '✨ Section 2',
+                                            highlight_label: '🔥 Popular',
+                                            rows: [{
+                                                header: '',
+                                                title: '🏷️ Coupon',
+                                                description: '',
+                                                id: '#CouponCode'
+                                            }]
+                                        }
+                                    ]
+                                }
+                            ]
+                        }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!label': {
+                    try {
+                        await sock.sendMessage(normalizedJid, {
+                            text: '🏷️ Message sent with secureMetaServiceLabel!',
+                            secureMetaServiceLabel: true
+                        }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!spoiler': {
+                    try {
+                        const logoPath = path.join(__dirname, 'logo.png');
+                        await sock.sendMessage(normalizedJid, {
+                            image: { url: logoPath },
+                            caption: '❔ Spoiler Image',
+                            spoiler: true
+                        }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!lottie': {
+                    try {
+                        const faviconPath = path.join(__dirname, 'favicon.png');
+                        await sock.sendMessage(normalizedJid, {
+                            sticker: { url: faviconPath },
+                            isLottie: true
+                        }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!groupstatus': {
+                    try {
+                        if (!normalizedJid.endsWith('@g.us')) {
+                            await sock.sendMessage(normalizedJid, { text: '❌ This command can only be used in group chats!' }, { quoted: message });
+                            break;
+                        }
+                        const logoPath = path.join(__dirname, 'logo.png');
+                        await sock.sendMessage(normalizedJid, {
+                            image: { url: logoPath },
+                            caption: '👥 Group Status Update!',
+                            groupStatus: true
+                        });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!mentionall': {
+                    try {
+                        if (!normalizedJid.endsWith('@g.us')) {
+                            await sock.sendMessage(normalizedJid, { text: '❌ This command can only be used in group chats!' }, { quoted: message });
+                            break;
+                        }
+                        await sock.sendMessage(normalizedJid, {
+                            text: '📢 Mentioning all group participants using the mentionAll option!',
+                            mentionAll: true
+                        }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!viewonce': {
+                    try {
+                        const logoPath = path.join(__dirname, 'logo.png');
+                        await sock.sendMessage(normalizedJid, {
+                            image: { url: logoPath },
+                            caption: '👁️ View Once message (V1)',
+                            viewOnce: true
+                        }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!viewoncev2': {
+                    try {
+                        const logoPath = path.join(__dirname, 'logo.png');
+                        await sock.sendMessage(normalizedJid, {
+                            image: { url: logoPath },
+                            caption: '👁️ View Once V2 message',
+                            viewOnceV2: true
+                        }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!viewonceext': {
+                    try {
+                        const logoPath = path.join(__dirname, 'logo.png');
+                        await sock.sendMessage(normalizedJid, {
+                            image: { url: logoPath },
+                            caption: '👁️ View Once V2 Extension message',
+                            viewOnceV2Extension: true
+                        }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!interactivemsg': {
+                    try {
+                        const logoPath = path.join(__dirname, 'logo.png');
+                        const subcommand = args.toLowerCase().trim();
+
+                        if (subcommand === 'image') {
+                            await sock.sendMessage(normalizedJid, {
+                                image: { url: logoPath },
+                                caption: 'This is an Interactive Message with an Image Header!',
+                                title: 'Interactive Image',
+                                subtitle: 'Image Subtitle',
+                                footer: 'Innovators Baileys V2',
+                                interactiveButtons: [
+                                    {
+                                        name: 'quick_reply',
+                                        buttonParamsJson: JSON.stringify({
+                                            display_text: 'Click Me!',
+                                            id: 'img_click_id'
+                                        })
+                                    }
+                                ],
+                                hasMediaAttachment: true
+                            }, { quoted: message });
+                        }
+                        else if (subcommand === 'location') {
+                            await sock.sendMessage(normalizedJid, {
+                                location: {
+                                    degreesLatitude: -6.200000,
+                                    degreesLongitude: 106.816666,
+                                    name: 'InnovatorsSoft HQ'
+                                },
+                                caption: 'This is an Interactive Message with a Location Header!',
+                                title: 'HQ Location',
+                                subtitle: 'Jakarta, Indonesia',
+                                footer: 'Innovators Baileys V2',
+                                interactiveButtons: [
+                                    {
+                                        name: 'quick_reply',
+                                        buttonParamsJson: JSON.stringify({
+                                            display_text: 'View Website',
+                                            id: 'loc_click_id'
+                                        })
+                                    }
+                                ]
+                            }, { quoted: message });
+                        }
+                        else {
+                            await sock.sendMessage(normalizedJid, {
+                                text: 'This is a text-based Interactive message showing all native flow buttons!',
+                                title: 'Native Flow Showcase',
+                                subtitle: 'Subtitle Example',
+                                footer: 'Powered by Innovators Baileys V2',
+                                interactiveButtons: [
+                                    {
+                                        name: 'quick_reply',
+                                        buttonParamsJson: JSON.stringify({
+                                            display_text: 'Quick Reply',
+                                            id: 'qr_test_id'
+                                        })
+                                    },
+                                    {
+                                        name: 'cta_url',
+                                        buttonParamsJson: JSON.stringify({
+                                            display_text: 'Follow Channel',
+                                            url: 'https://whatsapp.com/channel/0029Vag9VSI2ZjCocqa2lB1y',
+                                            merchant_url: 'https://whatsapp.com/channel/0029Vag9VSI2ZjCocqa2lB1y'
+                                        })
+                                    },
+                                    {
+                                        name: 'cta_copy',
+                                        buttonParamsJson: JSON.stringify({
+                                            display_text: 'Copy Coupon',
+                                            copy_code: 'INNOVATORS_PRO_50'
+                                        })
+                                    },
+                                    {
+                                        name: 'cta_call',
+                                        buttonParamsJson: JSON.stringify({
+                                            display_text: 'Call Hotline',
+                                            phone_number: '+1234567890'
+                                        })
+                                    },
+                                    {
+                                        name: 'galaxy_message',
+                                        buttonParamsJson: JSON.stringify({
+                                            mode: 'published',
+                                            flow_message_version: '3',
+                                            flow_token: '1:1307913409923914:293680f87029f5a13d1ec5e35e718af3',
+                                            flow_id: '1307913409923914',
+                                            flow_cta: 'Open Flows Survey',
+                                            flow_action: 'navigate',
+                                            flow_action_payload: {
+                                                screen: 'QUESTION_ONE',
+                                                params: {
+                                                    user_id: '123456789',
+                                                    referral: 'campaign_xyz'
+                                                }
+                                            },
+                                            flow_metadata: {
+                                                flow_json_version: '201',
+                                                data_api_protocol: 'v2',
+                                                flow_name: 'Lead Qualification [en]',
+                                                data_api_version: 'v2',
+                                                categories: ['Lead Generation', 'Sales']
+                                            }
+                                        })
+                                    },
+                                    {
+                                        name: 'single_select',
+                                        buttonParamsJson: JSON.stringify({
+                                            title: 'Open Options List',
+                                            sections: [
+                                                {
+                                                    title: 'Available Services',
+                                                    highlight_label: '🔥 Highly Recommended',
+                                                    rows: [
+                                                        {
+                                                            header: 'Service A',
+                                                            title: 'Innovators Baileys Fork',
+                                                            description: 'Custom features & stability fixes',
+                                                            id: 'service_baileys_id'
+                                                        },
+                                                        {
+                                                            header: 'Service B',
+                                                            title: 'Rust Integration',
+                                                            description: 'High-performance messaging pipeline',
+                                                            id: 'service_rust_id'
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        })
+                                    }
+                                ]
+                            }, { quoted: message });
+                        }
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!call': {
+                    try {
+                        const parts = args && args.trim() ? args.trim().split(/\s+/) : [];
+                        let targetJid = normalizedJid;
+                        let targetAudio = './audio.mp3';
+
+                        if (parts.length > 0) {
+                            if (parts[0].endsWith('.mp3') || parts[0].endsWith('.wav') || parts[0].endsWith('.ogg')) {
+                                targetAudio = parts[0];
+                                if (parts[1]) {
+                                    targetJid = parts[1].includes('@') ? parts[1] : `${parts[1].replace(/\D/g, '')}@s.whatsapp.net`;
+                                }
+                            } else {
+                                targetJid = parts[0].includes('@') ? parts[0] : `${parts[0].replace(/\D/g, '')}@s.whatsapp.net`;
+                                if (parts[1]) {
+                                    targetAudio = parts[1];
+                                }
+                            }
+                        }
+
+                        await sock.sendMessage(normalizedJid, { text: `📞 Initiating voice call to ${targetJid} (audio: ${targetAudio})...` }, { quoted: message });
+                        const call = await sock.initiateCall(targetJid, {
+                            audioSource: targetAudio,
+                            durationMs: 42 * 1000,
+                            repeatAudio: true
+                        });
+                        call.on('ringing', () => console.log(`[Example] Call ${call.callId} is ringing...`));
+                        call.on('accepted', () => console.log(`[Example] Call ${call.callId} accepted by recipient`));
+                        call.on('connected', () => console.log(`[Example] Call ${call.callId} connected!`));
+                        call.on('audioReady', () => console.log(`[Example] Call ${call.callId} audio pipeline ready`));
+                        call.on('streaming', () => console.log(`[Example] Call ${call.callId} streaming audio`));
+                        call.on('ended', (reason) => {
+                            console.log(`[Example] Call ${call.callId} ended: ${reason}`);
+                        });
+                        call.on('error', (err) => {
+                            console.error(`[Example] Call error:`, err);
+                        });
+                    } catch (err) {
+                        console.log(err)
+                        await sock.sendMessage(normalizedJid, { text: `Call error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!vcall': {
+                    try {
+                        const parts = args && args.trim() ? args.trim().split(/\s+/) : [];
+                        let targetJid = normalizedJid;
+                        let targetVideo = './example.mp4';
+
+                        if (parts.length > 0) {
+                            if (parts[0].endsWith('.mp4') || parts[0].endsWith('.mkv') || parts[0].endsWith('.mov') || parts[0].endsWith('.avi')) {
+                                targetVideo = parts[0];
+                                if (parts[1]) {
+                                    targetJid = parts[1].includes('@') ? parts[1] : `${parts[1].replace(/\D/g, '')}@s.whatsapp.net`;
+                                }
+                            } else {
+                                targetJid = parts[0].includes('@') ? parts[0] : `${parts[0].replace(/\D/g, '')}@s.whatsapp.net`;
+                                if (parts[1]) {
+                                    targetVideo = parts[1];
+                                }
+                            }
+                        }
+
+                        await sock.sendMessage(normalizedJid, { text: `📹 Initiating video call to ${targetJid} (video: ${targetVideo})...` }, { quoted: message });
+                        const call = await sock.initiateCall(targetJid, {
+                            isVideo: true,
+                            videoSource: targetVideo,
+                            audioSource: './audio.mp3',
+                            videoFps: 15,
+                            isHorizontal: true, // true for horizontal/landscape, false for vertical/portrait
+                            durationMs: 30 * 1000,
+                            repeatAudio: true,
+                            videoLoop: true
+                        });
+
+                        call.on('ringing', () => console.log(`[Example] Video Call ${call.callId} is ringing...`));
+                        call.on('accepted', () => console.log(`[Example] Video Call ${call.callId} accepted by recipient`));
+                        call.on('connected', () => console.log(`[Example] Video Call ${call.callId} connected!`));
+                        call.on('videoStarted', () => console.log(`[Example] Video Call ${call.callId} video stream started`));
+                        call.on('videoEnded', () => console.log(`[Example] Video Call ${call.callId} video stream ended`));
+                        call.on('audioReady', () => console.log(`[Example] Video Call ${call.callId} audio pipeline ready`));
+                        call.on('streaming', () => console.log(`[Example] Video Call ${call.callId} streaming media`));
+                        call.on('ended', (reason) => {
+                            console.log(`[Example] Video Call ${call.callId} ended: ${reason}`);
+                        });
+                        call.on('error', (err) => {
+                            console.error(`[Example] Video Call error:`, err);
+                        });
+                    } catch (err) {
+                        console.log(err);
+                        await sock.sendMessage(normalizedJid, { text: `Video Call error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!callinfo': {
+                    try {
+                        const active = await sock.getActiveCalls();
+                        const stats = await sock.getVoipMemoryStats();
+                        const rssMb = stats?.process?.rssMb ?? Math.round((stats?.rss || 0) / 1024 / 1024);
+                        const workers = stats?.resourceManager?.activeWorkers ?? stats?.activeWorkers ?? stats?.workerCount ?? 0;
+                        const relays = stats?.resourceManager?.activeRelayConnections ?? stats?.relayConnections ?? stats?.relayConnectionCount ?? 0;
+                        if (!active || active.length === 0) {
+                            await sock.sendMessage(normalizedJid, {
+                                text: `📞 No active VoIP calls.\n\n📊 *VoIP Resource Stats:*\n• RSS: ${rssMb} MB\n• Active Workers: ${workers}\n• Active Relays: ${relays}`
+                            }, { quoted: message });
+                        } else {
+                            const list = active.map(c => `• [${c.id.slice(0, 8)}] -> ${c.jid} (${c.status}) [${c.direction || 'outgoing'}] [started: ${new Date(c.startedAt).toLocaleTimeString()}]`).join('\n');
+                            await sock.sendMessage(normalizedJid, {
+                                text: `📞 *Active Calls (${active.length}):*\n\n${list}\n\n📊 *VoIP Resource Stats:*\n• RSS: ${rssMb} MB | Workers: ${workers}`
+                            }, { quoted: message });
+                        }
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!calls': {
+                    try {
+                        const targets = args && args.trim() ? args.trim().split(/\s+/) : [normalizedJid];
+                        await sock.sendMessage(normalizedJid, { text: `📞 Initiating concurrent calls to ${targets.length} recipients...` }, { quoted: message });
+                        const requests = targets.map(target => ({
+                            jid: target.includes('@') ? target : `${target.replace(/\D/g, '')}@s.whatsapp.net`,
+                            options: {
+                                audioSource: './audio.mp3',
+                                durationMs: 30000,
+                                repeatAudio: true
+                            }
+                        }));
+                        const calls = await sock.initiateCalls(requests);
+                        for (const call of calls) {
+                            call.on('ringing', () => console.log(`[Example] Call ${call.callId} is ringing...`));
+                            call.on('connected', () => console.log(`[Example] Call ${call.callId} connected!`));
+                            call.on('ended', (reason) => console.log(`[Example] Call ${call.callId} ended: ${reason}`));
+                        }
+                        await sock.sendMessage(normalizedJid, { text: `✅ Successfully initiated ${calls.length} concurrent calls!` }, { quoted: message });
+                    } catch (err) {
+                        console.log(err)
+                        await sock.sendMessage(normalizedJid, { text: `Multi-call error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!endcall': {
+                    try {
+                        const targetCallId = args && args.trim() ? args.trim() : '';
+                        if (!targetCallId) {
+                            await sock.sendMessage(normalizedJid, { text: `Usage: !endcall <callId>` }, { quoted: message });
+                        } else {
+                            await sock.endCall(targetCallId);
+                            await sock.sendMessage(normalizedJid, { text: `📞 Terminated call ${targetCallId}` }, { quoted: message });
+                        }
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `End call error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!endallcalls': {
+                    try {
+                        const count = await sock.getActiveCallCount();
+                        await sock.endAllCalls();
+                        await sock.sendMessage(normalizedJid, { text: `📞 Terminated all ${count} active calls.` }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!acceptcall': {
+                    try {
+                        const voip = await sock.getVoipClient();
+                        const targetCallId = args && args.trim() ? args.trim() : (lastIncomingSession?.callId || Array.from(voip?.calls?.values() || []).find(c => c.isIncoming && !c.ended)?.callId);
+                        if (!targetCallId) {
+                            await sock.sendMessage(normalizedJid, { text: `❌ No incoming call found to accept. Usage: !acceptcall [callId]` }, { quoted: message });
+                            console.log("No incoming call found to accept.")
+                            break;
+                        }
+                        const existingSession = voip?.calls?.get(targetCallId) || (lastIncomingSession?.callId === targetCallId ? lastIncomingSession : null);
+                        if (existingSession && (existingSession.status === 'accepted' || existingSession.status === 'connected' || existingSession.status === 'audio_ready' || existingSession.status === 'streaming')) {
+                            await sock.sendMessage(normalizedJid, { text: `ℹ️ Call ${targetCallId} is already accepted (status: ${existingSession.status}).` }, { quoted: message });
+                            break;
+                        }
+                        await sock.sendMessage(normalizedJid, { text: `📞 Accepting incoming call ${targetCallId}...` }, { quoted: message });
+                        const session = await sock.acceptCall(targetCallId, undefined, false, {
+                            audio: './audio.mp3' // Uses the new in-process native silence generator (0 ffmpeg overhead)
+                        });
+                        await sock.sendMessage(normalizedJid, { text: `✅ Call ${targetCallId} accepted! Audio streaming (silence).` }, { quoted: message });
+                    } catch (err) {
+                        console.error(err);
+                        await sock.sendMessage(normalizedJid, { text: `Accept call error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!rejectcall': {
+                    try {
+                        const voip = await sock.getVoipClient();
+                        const parts = args && args.trim() ? args.trim().split(/\s+/) : [];
+                        let targetCallId = parts[0];
+                        let reason = parts[1] || 'declined';
+                        if (!targetCallId || targetCallId === 'busy' || targetCallId === 'declined') {
+                            if (targetCallId === 'busy' || targetCallId === 'declined') {
+                                reason = targetCallId;
+                            }
+                            targetCallId = lastIncomingSession?.callId || Array.from(voip?.calls?.values() || []).find(c => c.isIncoming && !c.ended)?.callId;
+                        }
+                        if (!targetCallId) {
+                            await sock.sendMessage(normalizedJid, { text: `❌ No incoming call found to reject. Usage: !rejectcall [callId] [reason]` }, { quoted: message });
+                            break;
+                        }
+                        await sock.rejectCall(targetCallId, undefined, reason);
+                        await sock.sendMessage(normalizedJid, { text: `📞 Rejected call ${targetCallId} (reason: ${reason})` }, { quoted: message });
+                    } catch (err) {
+                        console.error(err);
+                        await sock.sendMessage(normalizedJid, { text: `Reject call error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!mute': {
+                    try {
+                        const voip = await sock.getVoipClient();
+                        const targetCallId = args && args.trim()
+                            ? args.trim()
+                            : (lastIncomingSession?.callId || Array.from(voip?.calls?.values() || []).find(c => !c.ended)?.callId);
+                        if (!targetCallId) {
+                            await sock.sendMessage(normalizedJid, { text: `❌ No active call to mute. Usage: !mute [callId]` }, { quoted: message });
+                            break;
+                        }
+                        const session = voip?.calls?.get(targetCallId) || (lastIncomingSession?.callId === targetCallId ? lastIncomingSession : null);
+                        if (!session) {
+                            await sock.sendMessage(normalizedJid, { text: `❌ Call ${targetCallId} not found.` }, { quoted: message });
+                            break;
+                        }
+                        session.mute(true);
+                        await sock.sendMessage(normalizedJid, { text: `🔇 Call ${targetCallId} is now muted.` }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Mute error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!unmute': {
+                    try {
+                        const voip = await sock.getVoipClient();
+                        const targetCallId = args && args.trim()
+                            ? args.trim()
+                            : (lastIncomingSession?.callId || Array.from(voip?.calls?.values() || []).find(c => !c.ended)?.callId);
+                        if (!targetCallId) {
+                            await sock.sendMessage(normalizedJid, { text: `❌ No active call to unmute. Usage: !unmute [callId]` }, { quoted: message });
+                            break;
+                        }
+                        const session = voip?.calls?.get(targetCallId) || (lastIncomingSession?.callId === targetCallId ? lastIncomingSession : null);
+                        if (!session) {
+                            await sock.sendMessage(normalizedJid, { text: `❌ Call ${targetCallId} not found.` }, { quoted: message });
+                            break;
+                        }
+                        session.unmute();
+                        await sock.sendMessage(normalizedJid, { text: `🔊 Call ${targetCallId} is now unmuted.` }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Unmute error: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!voipstats': {
+                    try {
+                        const stats = await sock.getVoipMemoryStats();
+                        if (!stats) {
+                            await sock.sendMessage(normalizedJid, { text: `VoIP subsystem not initialized.` }, { quoted: message });
+                            break;
+                        }
+                        const rssMb = stats?.process?.rssMb ?? Math.round((stats?.rss || 0) / 1024 / 1024);
+                        const heapUsedMb = stats?.process?.heapUsedMb ?? Math.round((stats?.heapUsed || 0) / 1024 / 1024);
+                        const heapTotalMb = stats?.process?.heapTotalMb ?? Math.round((stats?.heapTotal || 0) / 1024 / 1024);
+                        const externalMb = stats?.process?.externalMb ?? Math.round((stats?.external || 0) / 1024 / 1024);
+                        const activeCalls = stats?.calls?.activeCalls ?? stats?.activeCalls ?? stats?.activeCallCount ?? 0;
+                        const activeWorkers = stats?.resourceManager?.activeWorkers ?? stats?.activeWorkers ?? stats?.workerCount ?? 0;
+                        const activeRelays = stats?.resourceManager?.activeRelayConnections ?? stats?.relayConnections ?? stats?.relayConnectionCount ?? 0;
+                        const activeFfmpeg = stats?.resourceManager?.activeFfmpegProcesses ?? stats?.ffmpegProcesses ?? stats?.ffmpegProcessCount ?? 0;
+                        const cachedModules = stats?.resourceManager?.compiledModulesCached ?? stats?.cachedModules ?? 0;
+
+                        const text = `📊 *VoIP Subsystem & Memory Stats:*\n\n` +
+                            `• *Process RSS:* ${rssMb} MB\n` +
+                            `• *Heap Used:* ${heapUsedMb} MB / ${heapTotalMb} MB\n` +
+                            `• *External Memory:* ${externalMb} MB\n` +
+                            `• *Active VoIP Calls:* ${activeCalls}\n` +
+                            `• *Active Workers:* ${activeWorkers}\n` +
+                            `• *Active Relays:* ${activeRelays}\n` +
+                            `• *FFmpeg Processes:* ${activeFfmpeg}\n` +
+                            `• *Cached WASM Modules:* ${cachedModules}`;
+                        await sock.sendMessage(normalizedJid, { text }, { quoted: message });
+                    } catch (err) {
+                        await sock.sendMessage(normalizedJid, { text: `Error fetching VoIP stats: ${err.message}` }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!snake': {
+                    try {
+                        const userName = message.pushName || 'Player';
+                        const snakePayload = createSnakePage(userName);
+                        const msg = generateWAMessageFromContent(normalizedJid, snakePayload, { quoted: message });
+                        await sock.relayMessage(normalizedJid, msg.message, { messageId: msg.key.id });
+                    } catch (err) {
+                        console.error('[SNAKE]', err);
+                        await sock.sendMessage(normalizedJid, {
+                            text: `❌ Snake Game failed\n\n${err?.message || String(err)}`
+                        }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!slots': {
+                    try {
+                        const slotsPayload = createSlotsPage();
+                        const msg = generateWAMessageFromContent(normalizedJid, slotsPayload, { quoted: message });
+                        await sock.relayMessage(normalizedJid, msg.message, { messageId: msg.key.id });
+                    } catch (err) {
+                        console.error('[SLOTS]', err);
+                        await sock.sendMessage(normalizedJid, {
+                            text: `❌ Slots Game failed\n\n${err?.message || String(err)}`
+                        }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!page': {
+                    try {
+                        const userName = message.pushName || 'Commander';
+                        const pagePayload = createSamplePage(userName);
+                        const msg = generateWAMessageFromContent(normalizedJid, pagePayload, { quoted: message });
+                        await sock.relayMessage(normalizedJid, msg.message, { messageId: msg.key.id });
+                    } catch (err) {
+                        console.error('[PAGE]', err);
+                        await sock.sendMessage(normalizedJid, {
+                            text: `❌ Sample Page failed\n\n${err?.message || String(err)}`
+                        }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!tikdown':
+                case '!livepage': {
+                    try {
+                        const targetUrl = args || 'https://tikdown.innovatorssoft.org/';
+                        const title = targetUrl.includes('tikdown') ? 'TikDown Downloader' : 'Live Web Page';
+                        const livePayload = createLivePage(targetUrl, title);
+                        const msg = generateWAMessageFromContent(normalizedJid, livePayload, { quoted: message });
+                        await sock.relayMessage(normalizedJid, msg.message, { messageId: msg.key.id });
+                    } catch (err) {
+                        console.error('[LIVE_PAGE]', err);
+                        await sock.sendMessage(normalizedJid, {
+                            text: `❌ Live Page failed\n\n${err?.message || String(err)}`
+                        }, { quoted: message });
+                    }
+                    break;
+                }
+                case '!html': {
+                    try {
+                        const userName = message.pushName || 'User';
+                        const audioPath = path.resolve(__dirname, 'audio.mp3');
+                        let audioBase64 = '';
+                        if (fs.existsSync(audioPath)) {
+                            audioBase64 = fs.readFileSync(audioPath).toString('base64');
+                        } else {
+                            const fallbackPath = path.resolve(process.cwd(), 'assets/examples/audio.mp3');
+                            if (fs.existsSync(fallbackPath)) {
+                                audioBase64 = fs.readFileSync(fallbackPath).toString('base64');
+                            }
+                        }
+
+                        const customHtml = `
+                            <div id="cardContainer" style="padding: 16px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: radial-gradient(circle at top right, #1e293b, #0f172a); color: #f8fafc; border-radius: 16px; border: 1px solid #334155; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5); user-select: none;">
+                                <style>
+                                    @keyframes eqBounce {
+                                        0% { height: 3px; }
+                                        50% { height: 12px; }
+                                        100% { height: 6px; }
+                                    }
+                                    .eq-anim-1 { animation: eqBounce 0.7s ease-in-out infinite alternate; }
+                                    .eq-anim-2 { animation: eqBounce 0.5s ease-in-out infinite alternate 0.2s; }
+                                    .eq-anim-3 { animation: eqBounce 0.8s ease-in-out infinite alternate 0.4s; }
+                                    .eq-paused { animation: none !important; height: 3px !important; }
+                                </style>
+                                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">
+                                    <div style="display: flex; align-items: center; gap: 8px;">
+                                        <span style="font-size: 24px;">⚡</span>
+                                        <div>
+                                            <h3 style="margin: 0; font-size: 16px; color: #38bdf8;">Innovators Baileys GenAI HTML</h3>
+                                            <p style="margin: 0; font-size: 12px; color: #94a3b8;">Interactive Web Component</p>
+                                        </div>
+                                    </div>
+                                    <div id="audioPill" style="display: inline-flex; align-items: center; gap: 6px; background: rgba(56, 189, 248, 0.15); border: 1px solid rgba(56, 189, 248, 0.35); padding: 5px 11px; border-radius: 20px; font-size: 11px; color: #38bdf8; cursor: pointer; transition: all 0.2s ease;">
+                                        <span id="audioIcon">🔊</span>
+                                        <span id="audioStatusText" style="font-weight: 600;">Playing Audio</span>
+                                        <span id="eqBars" style="display: inline-flex; align-items: flex-end; gap: 2px; height: 12px; margin-left: 2px;">
+                                            <span class="eq-bar eq-anim-1" style="width: 2px; height: 10px; background: #38bdf8; border-radius: 1px;"></span>
+                                            <span class="eq-bar eq-anim-2" style="width: 2px; height: 6px; background: #38bdf8; border-radius: 1px;"></span>
+                                            <span class="eq-bar eq-anim-3" style="width: 2px; height: 12px; background: #38bdf8; border-radius: 1px;"></span>
+                                        </span>
+                                    </div>
+                                </div>
+                                <div style="background: rgba(255, 255, 255, 0.05); padding: 12px; border-radius: 10px; margin-bottom: 12px;">
+                                    <p style="margin: 0; font-size: 13px; color: #cbd5e1; line-height: 1.4;">Welcome, <b>${userName}</b>! This message is rendered dynamically using <code style="color: #f43f5e; background: #27272a; padding: 2px 5px; border-radius: 4px;">sendRichHtml</code> with background audio.</p>
+                                </div>
+                                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 12px; text-align: center;">
+                                    <div style="background: #1e3a5f; padding: 8px; border-radius: 8px;">
+                                        <div style="font-size: 11px; color: #93c5fd;">STATUS</div>
+                                        <div style="font-size: 13px; font-weight: bold; color: #60a5fa;">Active ✅</div>
+                                    </div>
+                                    <div style="background: #3b2a54; padding: 8px; border-radius: 8px;">
+                                        <div style="font-size: 11px; color: #d8b4fe;">AUDIO</div>
+                                        <div style="font-size: 13px; font-weight: bold; color: #c084fc;">Playing 🎵</div>
+                                    </div>
+                                    <div style="background: #064e3b; padding: 8px; border-radius: 8px;">
+                                        <div style="font-size: 11px; color: #6ee7b7;">SPEED</div>
+                                        <div style="font-size: 13px; font-weight: bold; color: #34d399;">Fast 🚀</div>
+                                    </div>
+                                </div>
+                                <div id="footerBtn" style="text-align: center; padding: 10px; background: linear-gradient(135deg, #2563eb, #7c3aed); border-radius: 8px; font-weight: bold; font-size: 13px; cursor: pointer; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);">
+                                    Powered by @nimuthu/baliyes
+                                </div>
+
+                                <audio id="bgAudio" autoplay loop playsinline preload="auto" style="display: none;">
+                                    <source src="data:audio/mpeg;base64,${audioBase64}" type="audio/mpeg">
+                                    <source src="data:audio/mp3;base64,${audioBase64}" type="audio/mp3">
+                                </audio>
+
+                                <script>
+                                    (function() {
+                                        var audio = document.getElementById('bgAudio');
+                                        var pill = document.getElementById('audioPill');
+                                        var icon = document.getElementById('audioIcon');
+                                        var text = document.getElementById('audioStatusText');
+                                        var bars = document.querySelectorAll('.eq-bar');
+
+                                        function updateUI(isPlaying) {
+                                            if (icon) icon.textContent = isPlaying ? '🔊' : '🔇';
+                                            if (text) text.textContent = isPlaying ? 'Playing Audio' : 'Audio Paused';
+                                            if (pill) {
+                                                pill.style.background = isPlaying ? 'rgba(56, 189, 248, 0.2)' : 'rgba(148, 163, 184, 0.15)';
+                                                pill.style.borderColor = isPlaying ? 'rgba(56, 189, 248, 0.5)' : 'rgba(148, 163, 184, 0.3)';
+                                                pill.style.color = isPlaying ? '#38bdf8' : '#94a3b8';
+                                            }
+                                            bars.forEach(function(b) {
+                                                if (isPlaying) {
+                                                    b.classList.remove('eq-paused');
+                                                } else {
+                                                    b.classList.add('eq-paused');
+                                                }
+                                            });
+                                        }
+
+                                        if (audio) {
+                                            audio.volume = 0.7;
+                                            var playPromise = audio.play();
+                                            if (playPromise !== undefined) {
+                                                playPromise.then(function() {
+                                                    updateUI(true);
+                                                }).catch(function() {
+                                                    // Autoplay policy prevented playback; wait for user touch/click
+                                                    updateUI(false);
+                                                    if (text) text.textContent = 'Tap to Play 🎵';
+                                                    var startPlayback = function() {
+                                                        audio.play().then(function() {
+                                                            updateUI(true);
+                                                        }).catch(function() {});
+                                                        document.removeEventListener('click', startPlayback);
+                                                        document.removeEventListener('touchstart', startPlayback);
+                                                    };
+                                                    document.addEventListener('click', startPlayback);
+                                                    document.addEventListener('touchstart', startPlayback);
+                                                });
+                                            }
+
+                                            if (pill) {
+                                                pill.addEventListener('click', function(e) {
+                                                    e.stopPropagation();
+                                                    if (audio.paused) {
+                                                        audio.play().then(function() {
+                                                            updateUI(true);
+                                                        });
+                                                    } else {
+                                                        audio.pause();
+                                                        updateUI(false);
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    })();
+                                </script>
+                            </div>
+                        `;
+
+                        await sock.sendRichHtml(normalizedJid, {
+                            id: 'cmd-html',
+                            title: 'Rich HTML UI Card (with Background Audio)',
+                            html: customHtml.trim(),
+                            source: 'innovatorssoft'
+                        }, message);
+                    } catch (err) {
+                        console.error('[HTML]', err);
+                        await sock.sendMessage(normalizedJid, {
+                            text: `❌ HTML message failed\n\n${err?.message || String(err)}`
+                        }, { quoted: message });
+                    }
+                    break;
+                }
+            }
+        } catch (err) {
+            console.error(`Error processing message:`, err);
+        }
+    });
+}
+
+startBot().catch(err => {
+    console.error('Fatal error starting the bot:', err);
+});

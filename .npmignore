@@ -1,0 +1,13 @@
+node_modules
+package-lock.json
+docs
+CHANGELOG.md
+.gitignore
+readmes
+.github
+.vscode
+auth
+audio.mp3
+/lib/Wasm
+PRD.md
+voip-debug.log
